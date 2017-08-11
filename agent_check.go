@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -9,44 +10,57 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	systemstat "bitbucket.org/bertimus9/systemstat"
 )
 
-//TODO this should NOT be a global
-var CommandStr string
-
-func main() {
-	command := make(chan string, 1)
-	CommandStr = "UP"
-	ln, err := net.Listen("tcp", ":5309")
-	if err != nil {
-		log.Fatalln("there was an error:", err)
-	}
-	go Talk(ln, command)
-
-	ln2, err := net.Listen("tcp", "localhost:8675")
-	if err != nil {
-		log.Fatalln("there was an error:", err)
-	}
-	go Listen(ln2, command)
-
-	go updateCommand(command)
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, os.Kill)
-	s := <-c
-	log.Println("exiting on:", s)
+//CommandString string with a read/write mutex
+type CommandString struct {
+	sync.RWMutex
+	cmd         string
+	allowedCMDs map[string]string
 }
 
-func updateCommand(command chan string) {
-	for {
-		CommandStr = <-command
+//NewCMDS returns a new command string
+func NewCMDS() *CommandString {
+	aCMDs := make(map[string]string)
+	aCMDs["READY"] = "READY"
+	aCMDs["DRAIN"] = "DRAIN"
+	aCMDs["MAINT"] = "MAINT"
+	aCMDs["DOWN"] = "DOWN"
+	aCMDs["FAILED"] = "FAILED"
+	aCMDs["STOPPED"] = "STOPPED"
+	aCMDs["UP"] = "UP"
+	return &CommandString{
+		cmd:         "UP",
+		allowedCMDs: aCMDs,
 	}
 }
 
-func get_idle() (out int) {
+//Set sets the command strings value
+func (cs *CommandString) Set(value string) string {
+	cs.Lock()
+	defer cs.Unlock()
+
+	uv := strings.ToUpper(value)
+	if cmd, ok := cs.allowedCMDs[uv]; ok {
+		cs.cmd = cmd
+		return cmd + " OK"
+	}
+	return "NOT SET"
+}
+
+//Get gets the command strings value
+func (cs *CommandString) Get() string {
+	cs.RLock()
+	defer cs.RUnlock()
+
+	return cs.cmd
+}
+
+func getIdle() (out int) {
 	sample1 := systemstat.GetCPUSample()
 	time.Sleep(100 * time.Millisecond)
 	sample2 := systemstat.GetCPUSample()
@@ -55,26 +69,27 @@ func get_idle() (out int) {
 	return int(idlePercent)
 }
 
-func handleTalk(conn net.Conn, command <-chan string) {
+func handleTalk(conn net.Conn, cmd *CommandString) {
 	defer conn.Close()
-	idle := strconv.Itoa(get_idle())
-	io.WriteString(conn, CommandStr+" "+idle+"% \n")
+	idle := strconv.Itoa(getIdle())
+	commandStr := cmd.Get()
+	io.WriteString(conn, commandStr+" "+idle+"% \n")
 	return
 }
 
-func handleListen(conn net.Conn, command chan string) {
+func handleListen(conn net.Conn, cmd *CommandString) {
 	defer conn.Close()
 	line, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
 		return
 	}
 	line = strings.Replace(line, "\n", "", -1)
-	command <- line
-	conn.Write([]byte(line + " OK \n"))
+	rtn := cmd.Set(line)
+	conn.Write([]byte(rtn + "\n"))
 	return
 }
 
-func Talk(ln net.Listener, command chan string) {
+func talk(ln net.Listener, cmd *CommandString) {
 	defer ln.Close()
 	for {
 		conn, err := ln.Accept()
@@ -82,11 +97,11 @@ func Talk(ln net.Listener, command chan string) {
 			log.Println("there was an error:", err)
 			break
 		}
-		go handleTalk(conn, command)
+		go handleTalk(conn, cmd)
 	}
 }
 
-func Listen(ln net.Listener, command chan string) {
+func listen(ln net.Listener, cmd *CommandString) {
 	defer ln.Close()
 	for {
 		conn, err := ln.Accept()
@@ -94,7 +109,40 @@ func Listen(ln net.Listener, command chan string) {
 			log.Println("there was an error:", err)
 			break
 		}
-		go handleListen(conn, command)
+		go handleListen(conn, cmd)
 	}
 
+}
+
+func main() {
+	listenPort := os.Getenv("AC_LISTEN_PORT")
+	if listenPort == "" {
+		fmt.Fprintf(os.Stderr, "AC LISTEN PORT not set\n")
+		os.Exit(1)
+	}
+	talkPort := os.Getenv("AC_TALK_PORT")
+	if talkPort == "" {
+		fmt.Fprintf(os.Stderr, "AC TALK PORT not set\n")
+		os.Exit(1)
+	}
+	cmd := NewCMDS()
+
+	lp := ":" + listenPort
+	ln, err := net.Listen("tcp", lp)
+	if err != nil {
+		log.Fatalln("there was an error:", err)
+	}
+	go talk(ln, cmd)
+
+	tp := "localhost:" + talkPort
+	ln2, err := net.Listen("tcp", tp)
+	if err != nil {
+		log.Fatalln("there was an error:", err)
+	}
+	go listen(ln2, cmd)
+
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, os.Kill)
+	s := <-c
+	log.Println("exiting on:", s)
 }
